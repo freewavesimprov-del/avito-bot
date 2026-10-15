@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+# Runtime-каталог: SQLite БД, выгрузки чатов, отчёты replay, install-токены B24.
+# Создаётся автоматически при старте сервиса — коммитить нечего.
+data/
+.pytest_cache/
+.ruff_cache/
+*.log
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,66 @@
+# Nginx site для avito-bot
+#
+# Положить в:        /etc/nginx/sites-available/avito-bot.conf
+# Активировать:      ln -s /etc/nginx/sites-available/avito-bot.conf /etc/nginx/sites-enabled/
+# HTTPS-сертификат:  certbot --nginx -d avito-bot.example.ru
+#
+# Перед HTTPS — вручную поправь server_name на свой поддомен.
+
+# HTTP -> HTTPS редирект (certbot обычно дописывает сам)
+server {
+    listen 80;
+    server_name avito-bot.example.ru;
+
+    # ACME-challenge оставляем доступным
+    location /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    server_name avito-bot.example.ru;
+
+    # certbot подставит сюда пути после `certbot --nginx -d ...`
+    # ssl_certificate     /etc/letsencrypt/live/avito-bot.example.ru/fullchain.pem;
+    # ssl_certificate_key /etc/letsencrypt/live/avito-bot.example.ru/privkey.pem;
+
+    # Безопасные дефолты SSL
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    # Лимиты тела запроса (вебхук от B24 редко больше 1 МБ)
+    client_max_body_size 2m;
+
+    # Healthcheck — публично, удобно для мониторинга
+    location = /health {
+        proxy_pass http://127.0.0.1:8000/health;
+        access_log off;
+    }
+
+    # Webhook B24
+    location = /b24/webhook {
+        proxy_pass http://127.0.0.1:8000/b24/webhook;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 30s;
+    }
+
+    # /dev/* отключаем в проде — они для локальной отладки.
+    location ^~ /dev/ {
+        return 404;
+    }
+
+    # На всё прочее — 404 (бот не должен светить ничем лишним наружу)
+    location / {
+        return 404;
+    }
+}
