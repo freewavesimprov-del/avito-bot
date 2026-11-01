@@ -152,7 +152,10 @@ maybe_register_dev_routes()
 def _register_admin_routes() -> None:
     from app.routes.admin import router as admin_router
 
+    from app.routes.studio import router as studio_router
+
     app.include_router(admin_router)
+    app.include_router(studio_router)
 
 
 _register_admin_routes()

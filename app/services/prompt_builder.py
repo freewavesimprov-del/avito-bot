@@ -172,7 +172,7 @@ def _read_text(path: Path) -> str:
 
 
 @lru_cache(maxsize=1)
-def build_system_prompt() -> PromptPayload:
+def _legacy_system_prompt(_catalog_stamp: tuple = ()) -> PromptPayload:
     """Собрать system prompt. Кэшируется; reset_cache() для перечитки.
 
     Читает основной каталог (из 1С) + manual-слой (ручные дополнения) и мерджит.
@@ -203,4 +203,52 @@ def build_system_prompt() -> PromptPayload:
 
 
 def reset_cache() -> None:
-    build_system_prompt.cache_clear()
+    _legacy_system_prompt.cache_clear()
+
+
+def compose_prompt(catalog: dict, behavior: dict | None = None, query: str = "", ad_id: str = "") -> PromptPayload:
+    """Used by the live bot and by the isolated admin playground."""
+    from app.services.avito_import import catalog_context
+    from app.services.studio import defaults, render_behavior
+
+    updated = str(catalog.get("updated") or "—")
+    if catalog.get("format") == "avito":
+        table = "Характеристики и цены — в структурированных данных объявлений ниже."
+        context = catalog_context(catalog, query, ad_id)
+    else:
+        table = _build_skus_table(catalog.get("items", []))
+        context = ""
+    return PromptPayload(
+        system=render_behavior(behavior or defaults(), table, updated) + context,
+        updated_date=updated, skus_count=len(catalog.get("items", [])),
+    )
+
+
+def build_system_prompt() -> PromptPayload:
+    from app.services.studio import active_behavior
+
+    main = json.loads(_skus_path().read_text(encoding="utf-8"))
+    behavior = active_behavior()
+    if main.get("format") == "avito":
+        return compose_prompt(main, behavior)
+    if behavior:
+        from app.services.catalog_parser import load_manual, merge_main_and_manual
+
+        return compose_prompt(merge_main_and_manual(main, load_manual(_skus_path())), behavior)
+    from app.services.catalog_parser import manual_path_for
+
+    manual = manual_path_for(_skus_path())
+    stamp = (str(_skus_path().resolve()), _skus_path().stat().st_mtime_ns, manual.stat().st_mtime_ns if manual.exists() else None)
+    return _legacy_system_prompt(stamp)
+
+
+def reply_prompt(text: str, history: list[dict], ad_note: str) -> str:
+    from app.services.studio import active_behavior
+
+    catalog = json.loads(_skus_path().read_text(encoding="utf-8"))
+    if catalog.get("format") != "avito":
+        prompt = build_system_prompt().system
+        return prompt + ("\n\n" + ad_note if ad_note else "")
+    selected = re.search(r"Объявление №(\d+)", ad_note)
+    query = " ".join(str(h.get("message", "")) for h in history[-6:] if h.get("direction") == "in") + " " + text
+    return compose_prompt(catalog, active_behavior(), query, selected[1] if selected else "").system

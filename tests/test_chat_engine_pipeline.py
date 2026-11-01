@@ -40,7 +40,7 @@ async def _db():
 
 
 def _stub_llm(reply: str):
-    async def _fake(_text: str, _history: list[dict]) -> str:
+    async def _fake(_text: str, _history: list[dict], _ad_note: str = "") -> str:
         return reply
 
     return _fake
@@ -94,7 +94,7 @@ async def test_hard_trigger_complaint_skips_llm(monkeypatch):
     """LLM не должен вызываться, если сработал hard-trigger."""
     called = {"n": 0}
 
-    async def _spy(_text, _history):
+    async def _spy(_text, _history, _ad_note=""):
         called["n"] += 1
         return "это не должно попасть в ответ"
 
@@ -145,7 +145,7 @@ async def test_repeat_loop_triggers_escalation(monkeypatch):
     """Если клиент задаёт один и тот же вопрос 3+ раз — эскалация без LLM."""
     calls = {"n": 0}
 
-    async def _spy(text, history):
+    async def _spy(text, history, _ad_note=""):
         calls["n"] += 1
         return "обычный ответ"
 
@@ -169,7 +169,7 @@ async def test_repeat_loop_triggers_escalation(monkeypatch):
 async def test_repeat_loop_normalizes_punctuation(monkeypatch):
     """Похожие сообщения с разной пунктуацией/регистром считаются одним вопросом."""
 
-    async def _stub(text, history):
+    async def _stub(text, history, _ad_note=""):
         return "ок"
 
     monkeypatch.setattr(chat_engine, "_generate", _stub)
@@ -186,7 +186,7 @@ async def test_after_any_escalation_bot_is_silent(monkeypatch):
     """После любой эскалации (hard-trigger / LLM-маркер / post-filter) бот должен
     в этом диалоге больше ничего не отвечать — operator_led=True."""
 
-    async def _llm_with_escalate(text, history):
+    async def _llm_with_escalate(text, history, _ad_note=""):
         return "Передам менеджеру.\nESCALATE: проверка"
 
     monkeypatch.setattr(chat_engine, "_generate", _llm_with_escalate)
@@ -195,7 +195,7 @@ async def test_after_any_escalation_bot_is_silent(monkeypatch):
     assert r1.action == "escalated"
 
     # Подменяем LLM чтобы убедиться: даже если LLM теперь вернул бы что-то — бот молчит
-    async def _should_not_be_called(text, history):
+    async def _should_not_be_called(text, history, _ad_note=""):
         raise AssertionError("LLM не должна вызываться после эскалации")
 
     monkeypatch.setattr(chat_engine, "_generate", _should_not_be_called)
@@ -208,7 +208,7 @@ async def test_after_any_escalation_bot_is_silent(monkeypatch):
 async def test_after_hard_trigger_bot_is_silent(monkeypatch):
     """То же самое для hard-trigger (например, complaint)."""
 
-    async def _no_llm(text, history):
+    async def _no_llm(text, history, _ad_note=""):
         raise AssertionError("LLM не должна вызываться")
 
     monkeypatch.setattr(chat_engine, "_generate", _no_llm)
@@ -224,7 +224,7 @@ async def test_history_passed_to_llm(monkeypatch):
     """Проверяем, что в LLM уезжает накопленная история диалога."""
     seen_history: list[dict] = []
 
-    async def _capture(text, history):
+    async def _capture(text, history, _ad_note=""):
         seen_history.extend(history)
         return "ок"
 

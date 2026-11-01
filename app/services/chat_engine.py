@@ -42,7 +42,7 @@ from app.services.logger import (
     log_event,
     mark_operator_led,
 )
-from app.services.prompt_builder import build_system_prompt
+from app.services.prompt_builder import reply_prompt
 from app.services.schedule import (
     b24_forward_allowed_now,
     bot_active_now,
@@ -112,6 +112,18 @@ class BotReply:
     reason: str | None = None
     blocked_text: str | None = None  # что LLM хотела сказать (только для action='blocked')
     stage: str = "stage4"
+
+
+def interpret_response(raw_reply: str) -> tuple[str, str | None, str | None]:
+    """Common interpretation/filtering for production and sandbox responses."""
+    cleaned, reason = parse_escalate_marker(raw_reply)
+    if cleaned and _DENIAL_RE.search(cleaned):
+        cleaned = f"Уточню по этой модели у менеджера — {manager_reply_phrase()}."
+        reason = reason or "товара нет в таблице"
+    if not cleaned and not reason:
+        cleaned, reason = ESCALATION_CLIENT_MESSAGE, "empty_llm_reply"
+    _, blocked = post_filter(cleaned)
+    return cleaned, reason, blocked
 
 
 async def _escalate_or_hold(
@@ -236,23 +248,8 @@ async def process_message(
     raw_reply = await _generate(text, history, ad_note)
 
     # 5. Парсим ESCALATE из ответа LLM
-    cleaned, escalate_reason = parse_escalate_marker(raw_reply)
-    # Страховка: «такого нет в каталоге» клиенту не уходит никогда. Каталог
-    # бота — не весь ассортимент, и так бот «потерял» Басю (01.10.2026).
-    if cleaned and _DENIAL_RE.search(cleaned):
-        logger.info("dialog %s: отказ «нет в каталоге» заменён передачей менеджеру", dialog_id)
-        cleaned = f"Уточню по этой модели у менеджера — {manager_reply_phrase()}."
-        escalate_reason = escalate_reason or "товара нет в таблице"
-
-    # 6. Post-filter
-    if cleaned:
-        ok, block_reason = post_filter(cleaned)
-    else:
-        # LLM ничего внятного не вернула — эскалируем
-        ok, block_reason = True, None
-        if not escalate_reason:
-            cleaned = ESCALATION_CLIENT_MESSAGE
-            escalate_reason = "empty_llm_reply"
+    cleaned, escalate_reason, block_reason = interpret_response(raw_reply)
+    ok = block_reason is None
 
     # 7. Решение
     if not ok:
@@ -303,13 +300,15 @@ async def process_message(
 async def _generate(user_text: str, history: list[dict], ad_note: str = "") -> str:
     """Mock или LLM. Внутренний — внешний интерфейс — process_message()."""
     settings = get_settings()
-    if settings.MOCK_LLM:
+    from app.services.studio import preview_context
+
+    preview = preview_context.get()
+    if preview and preview.mode == "mock":
+        return "[MOCK] Тестовый ответ получен. Для проверки каталога и сценариев включите YandexGPT."
+    if preview is None and settings.MOCK_LLM:
         return _mock_reply(user_text)
 
-    system_prompt = build_system_prompt().system
-    if ad_note:
-        # Объявление клиента — последним блоком, чтобы перевешивало каталог.
-        system_prompt = f"{system_prompt}\n\n---\n\n{ad_note}"
+    system_prompt = preview.prompt if preview else reply_prompt(user_text, history, ad_note)
     messages = _history_to_chat_messages(history, current_user_text=user_text)
 
     try:

@@ -227,8 +227,9 @@ def build_diff(old: dict[str, Any] | None, new: dict[str, Any]) -> dict[str, Any
         diffs: dict[str, Any] = {}
         if o.get("price") != n.get("price"):
             diffs["price"] = (o.get("price"), n.get("price"))
-        if o.get("stock") != n.get("stock"):
-            diffs["stock"] = (o.get("stock"), n.get("stock"))
+        for field in ("stock", "name", "color", "parameters", "dimensions_cm", "availability", "description", "location"):
+            if o.get(field) != n.get(field):
+                diffs[field] = (o.get(field), n.get(field))
         if diffs:
             changed.append({"name": n.get("name"), "article": n.get("article"), **diffs})
         else:
@@ -244,7 +245,7 @@ def build_diff(old: dict[str, Any] | None, new: dict[str, Any]) -> dict[str, Any
         "changed": changed,
         "unchanged": same,
         "out_of_stock_new": [it.get("name") for it in new_items.values() if it.get("stock") == 0],
-        "low_stock_new": [it.get("name") for it in new_items.values() if 0 < it.get("stock", 0) < 5],
+        "low_stock_new": [it.get("name") for it in new_items.values() if 0 < (it.get("stock") or 0) < 5],
     }
 
 

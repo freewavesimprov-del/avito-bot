@@ -112,6 +112,13 @@ async def note_for(bitrix_client: Any, dialog_id: str) -> str:
     item_id = await item_of_dialog(bitrix_client, dialog_id)
     if not item_id:
         return ""
+    # A published Avito export already contains the product's exact parameters.
+    # No Avito API request is needed to identify a listing from that export.
+    from app.services.studio import catalog_path, read_json
+
+    catalog = read_json(catalog_path(), {})
+    if catalog.get("format") == "avito":
+        return f"Объявление №{item_id}"
     try:
         items = await _load_items()
     except Exception as exc:                              # noqa: BLE001
