@@ -13,3 +13,5 @@ data/
 .idea/
 .vscode/
 .studio/
+.venv-local/
+.env.local
