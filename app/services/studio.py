@@ -12,7 +12,6 @@ import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -56,7 +55,6 @@ class Behavior(BaseModel):
 
 class PreviewContext(BaseModel):
     prompt: str
-    mode: Literal["mock", "live"]
 
 
 preview_context: ContextVar[PreviewContext | None] = ContextVar("studio_preview", default=None)
@@ -109,9 +107,28 @@ def identifier(value: str) -> str:
 
 
 def defaults() -> dict:
+    from app.services.filters import ESCALATION_CLIENT_MESSAGE
     from app.services.prompt_builder import _FAQ_PATH, _PROMPT_PATH
 
-    return Behavior(system_prompt=_PROMPT_PATH.read_text(), faq=_FAQ_PATH.read_text()).model_dump()
+    prompt = _PROMPT_PATH.read_text()
+    sections = [
+        ("availability", "Наличие", "Клиент спрашивает наличие", "Наличие товара — уточняет менеджер"),
+        ("delivery", "Доставка", "Клиент спрашивает доставку", "Доставка — как отвечать"),
+        ("variants", "Варианты модели", "Клиент не уточнил цвет или размер", "Если есть несколько вариантов модели (разные цвета, размеры) — спрашивай уточнение"),
+        ("handover", "Передача менеджеру", "Запрос требует менеджера", "Когда передавать менеджеру"),
+    ]
+    scenarios = []
+    for key, name, condition, heading in sections:
+        match = re.search(r"(?m)^#{2,3} " + re.escape(heading) + r"\n(.*?)(?=\n#{2,3} |\Z)", prompt, re.S)
+        if match:
+            paragraphs = [p.strip() for p in match[1].split("\n\n") if p.strip()]
+            steps = [p[i:i + 1900] for p in paragraphs for i in range(0, len(p), 1900)][:20]
+            scenarios.append(Scenario(id=key, name=name, condition=condition, steps=steps))
+    return Behavior(
+        system_prompt=prompt, faq=_FAQ_PATH.read_text(),
+        templates=[Template(id="handover", name="Текущая фраза передачи менеджеру", text=ESCALATION_CLIENT_MESSAGE)],
+        scenarios=scenarios,
+    ).model_dump()
 
 
 def behavior_state() -> dict:
@@ -166,6 +183,8 @@ def mutate_behavior(expected: str, action: str, behavior: dict | None = None, ve
                 state["history"] = state["history"][:20]
                 state["active"] = state["draft"]
                 state["published"] = True
+            elif action == "baseline":
+                state["draft"] = state["active"] if state.get("published") else defaults()
             else:
                 raise ValueError("Неизвестное действие")
         state["revision"] = uuid.uuid4().hex

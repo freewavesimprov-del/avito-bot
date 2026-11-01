@@ -303,8 +303,6 @@ async def _generate(user_text: str, history: list[dict], ad_note: str = "") -> s
     from app.services.studio import preview_context
 
     preview = preview_context.get()
-    if preview and preview.mode == "mock":
-        return "[MOCK] Тестовый ответ получен. Для проверки каталога и сценариев включите YandexGPT."
     if preview is None and settings.MOCK_LLM:
         return _mock_reply(user_text)
 
@@ -314,6 +312,8 @@ async def _generate(user_text: str, history: list[dict], ad_note: str = "") -> s
     try:
         return await generate(system_prompt=system_prompt, user_messages=messages)
     except LLMError as e:
+        if preview is not None:
+            raise
         logger.warning("LLM failed, fallback to escalation: %s", e)
         return "Уточню у менеджера, ответит в этом же чате. ESCALATE: llm_unavailable"
 

@@ -19,7 +19,7 @@ from typing import Any
 
 import httpx
 
-from app.config import get_settings
+from app.services.yandex_connection import Connection, connection
 
 logger = logging.getLogger("avito_bot.llm")
 
@@ -87,30 +87,31 @@ async def generate(
     temperature: float = 0.3,
     max_tokens: int = 200,  # ~400 символов по-русски — хватает на 3-4 строки списка
     max_retries: int = 2,
+    connection_override: Connection | None = None,
 ) -> str:
     """Вызов YandexGPT. Возвращает текст ответа или бросает LLMError.
 
     Ретраи: на таймаут и 5xx, до max_retries попыток (итого 1 + max_retries запросов).
     """
-    settings = get_settings()
-    if not settings.YC_API_KEY or not settings.YC_FOLDER_ID:
+    settings = connection_override or connection()
+    if not settings.api_key.get_secret_value() or not settings.folder_id:
         raise LLMError("YC_API_KEY / YC_FOLDER_ID не заданы в конфиге")
 
     headers = {
-        "Authorization": f"Api-Key {settings.YC_API_KEY}",
+        "Authorization": f"Api-Key {settings.api_key.get_secret_value()}",
         "Content-Type": "application/json",
-        "x-folder-id": settings.YC_FOLDER_ID,
+        "x-folder-id": settings.folder_id,
     }
     payload = _build_payload(
         system_prompt=system_prompt,
         user_messages=user_messages,
-        folder_id=settings.YC_FOLDER_ID,
-        model=settings.YC_MODEL,
+        folder_id=settings.folder_id,
+        model=settings.model,
         temperature=temperature,
         max_tokens=max_tokens,
     )
 
-    timeout = httpx.Timeout(settings.YC_TIMEOUT_SEC)
+    timeout = httpx.Timeout(settings.timeout)
     attempt = 0
     last_exc: Exception | None = None
     while attempt <= max_retries:
@@ -119,13 +120,13 @@ async def generate(
             async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(YC_ENDPOINT, json=payload, headers=headers)
             if resp.status_code >= 500:
-                last_exc = LLMError(f"LLM 5xx: {resp.status_code} {resp.text[:200]}")
+                last_exc = LLMError(f"LLM 5xx: {resp.status_code}")
                 logger.warning(
                     "YC 5xx (attempt %d/%d): %d", attempt, max_retries + 1, resp.status_code
                 )
             elif resp.status_code >= 400:
                 # 4xx — не ретраим, это ошибка запроса / прав / лимитов
-                raise LLMError(f"LLM 4xx: {resp.status_code} {resp.text[:200]}")
+                raise LLMError(f"LLM 4xx: {resp.status_code}")
             else:
                 return _extract_text(resp.json())
         except httpx.TimeoutException as e:
@@ -133,9 +134,9 @@ async def generate(
             logger.warning("YC timeout (attempt %d/%d)", attempt, max_retries + 1)
         except httpx.HTTPError as e:
             last_exc = e
-            logger.warning("YC HTTP error (attempt %d/%d): %s", attempt, max_retries + 1, e)
+            logger.warning("YC HTTP error (attempt %d/%d): %s", attempt, max_retries + 1, type(e).__name__)
 
         if attempt <= max_retries:
             await asyncio.sleep(0.5 * attempt)  # линейный backoff
 
-    raise LLMError(f"YC failed after {attempt} attempts: {last_exc}")
+    raise LLMError(f"YC failed after {attempt} attempts ({type(last_exc).__name__})")

@@ -9,10 +9,9 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 from starlette.concurrency import run_in_threadpool
 
-from app.config import get_settings
 from app.routes.admin import _verify_basic
 from app.services import studio as store
 from app.services.avito_import import MAX_UPLOAD, choose_items, read_export, summarize
@@ -24,6 +23,7 @@ from app.services.catalog_parser import (
     parse_excel,
 )
 from app.services.prompt_builder import compose_prompt, reset_cache
+from app.services.yandex_connection import Connection, connection, metadata, save_connection
 
 router = APIRouter(prefix="/admin/studio", tags=["admin"])
 User = Annotated[str, Depends(_verify_basic)]
@@ -156,16 +156,16 @@ def catalog_restore(body: RestoreCatalog, user: User) -> dict:
 
 @router.get("/state")
 def studio_state(user: User) -> dict:
-    settings = get_settings()
     return {"behavior": store.behavior_state(), "catalog": summarize(current_catalog()),
             "baseline": store.fingerprint(store.catalog_path()),
-            "live_available": bool(settings.YC_API_KEY and settings.YC_FOLDER_ID),
+            "yandex": metadata(),
+            "baseline_source": "Действующие настройки бота: system_prompt.md, faq_extras.md и фраза передачи из кода. Опубликованные правки имеют приоритет.",
             "filter_notice": "Действуют общие фильтры: контакты, внешние ссылки, скидки и точные даты. Редактор их не отключает."}
 
 
 class BehaviorAction(BaseModel):
     revision: str
-    action: Literal["save", "publish", "restore"]
+    action: Literal["save", "publish", "restore", "baseline"]
     behavior: store.Behavior | None = None
     version: str = ""
 
@@ -192,9 +192,9 @@ class HistoryMessage(BaseModel):
 
 
 class PlaygroundMessage(BaseModel):
+    model_config = {"extra": "forbid"}
     message: str = Field(min_length=1, max_length=4000)
     history: list[HistoryMessage] = Field(default_factory=list, max_length=30)
-    mode: Literal["mock", "live"] = "mock"
     source: Literal["draft", "active"] = "draft"
     catalog_draft: str = ""
     ad_id: str = Field(default="", max_length=30)
@@ -215,9 +215,8 @@ async def playground(body: PlaygroundMessage, user: User) -> dict:
 
     if not body.message.strip():
         raise HTTPException(400, "Введите сообщение")
-    s = get_settings()
-    if body.mode == "live" and not (s.YC_API_KEY and s.YC_FOLDER_ID):
-        raise HTTPException(503, "YandexGPT не настроен. Mock проверяет интерфейс, но не качество сценариев.")
+    if not metadata()["configured"]:
+        raise HTTPException(503, "Подключите YandexGPT в форме на этой странице.")
     if body.source == "active" and body.catalog_draft:
         raise HTTPException(400, "Черновик каталога доступен только в режиме черновика")
     state = store.behavior_state()
@@ -231,18 +230,60 @@ async def playground(body: PlaygroundMessage, user: User) -> dict:
     hit = check_hard_triggers(body.message)
     repeats = chat_engine._count_repeats([*history, {"direction": "in", "message": body.message}], body.message)
     if hit or repeats >= chat_engine.REPEAT_THRESHOLD:
-        return {"text": ESCALATION_CLIENT_MESSAGE, "action": "escalated", "reason": hit.reason if hit else "repeat_loop", "mode": body.mode, "model_called": False}
-    token = store.preview_context.set(store.PreviewContext(prompt=prompt.system, mode=body.mode))
+        return {"text": ESCALATION_CLIENT_MESSAGE, "action": "escalated", "reason": hit.reason if hit else "repeat_loop", "model_called": False}
+    token = store.preview_context.set(store.PreviewContext(prompt=prompt.system))
     try:
         raw = await chat_engine._generate(body.message, history)
+    except chat_engine.LLMError as exc:
+        raise HTTPException(502, "YandexGPT не ответил. Проверьте соединение, ключ, каталог и доступ к модели.") from exc
     finally:
         store.preview_context.reset(token)
     cleaned, reason, blocked = chat_engine.interpret_response(raw)
     return {"text": ESCALATION_CLIENT_MESSAGE if blocked else cleaned,
             "action": "blocked" if blocked else "escalated" if reason else "sent",
             "reason": blocked or reason, "blocked_text": cleaned if blocked else None,
-            "mode": body.mode, "model_called": body.mode == "live",
+            "model_called": True,
             "source": body.source, "catalog": summarize(catalog)}
+
+
+class YandexForm(BaseModel):
+    api_key: SecretStr | None = None
+    folder_id: str = Field(max_length=100)
+    model: str = Field(default="yandexgpt-lite", min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_-]+$")
+
+
+def candidate_connection(body: YandexForm) -> Connection:
+    current = connection()
+    entered = body.api_key.get_secret_value().strip() if body.api_key else ""
+    if entered and any(ord(c) < 33 or ord(c) > 126 for c in entered):
+        raise HTTPException(400, "Проверьте API-ключ: он не должен содержать пробелы или переносы строк")
+    key = SecretStr(entered) if entered else current.api_key
+    if not key.get_secret_value() or not body.folder_id.strip():
+        raise HTTPException(400, "Нужны API-ключ и ID каталога Yandex Cloud")
+    return Connection(api_key=key, folder_id=body.folder_id.strip(), model=body.model, timeout=current.timeout)
+
+
+@router.post("/yandex/save")
+def yandex_save(body: YandexForm, user: User) -> dict:
+    value = candidate_connection(body)
+    save_connection(value, bool(body.api_key and body.api_key.get_secret_value().strip()))
+    return metadata()
+
+
+@router.post("/yandex/test")
+async def yandex_test(body: YandexForm, user: User) -> dict:
+    from app.services.llm import ChatMessage, LLMError, generate
+
+    value = candidate_connection(body)
+    try:
+        answer = await generate(system_prompt="Ответь одним словом: ОК.",
+                                user_messages=[ChatMessage(role="user", text="Проверка соединения")],
+                                connection_override=value, max_tokens=10, max_retries=0)
+        if not answer.strip():
+            raise LLMError("empty response")
+    except LLMError as exc:
+        raise HTTPException(502, "Нет ответа YandexGPT. Проверьте права ключа, ID каталога, модель и сетевой доступ.") from exc
+    return {"status": "ok", "message": "YandexGPT ответил. Проверенные параметры ещё нужно сохранить."}
 
 
 @router.get("", response_class=HTMLResponse)

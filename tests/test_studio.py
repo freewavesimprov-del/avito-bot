@@ -175,7 +175,7 @@ async def test_playground_uses_draft_selected_ad_without_logging_or_delivery(stu
 
     monkeypatch.setattr(chat_engine, "generate", fake_generate)
     monkeypatch.setattr(chat_engine, "log_event", forbidden)
-    response = await client.post("/admin/studio/playground", json={"message": "Цена актуальная?", "mode": "live", "catalog_draft": token, "ad_id": "22222222"})
+    response = await client.post("/admin/studio/playground", json={"message": "Цена актуальная?", "catalog_draft": token, "ad_id": "22222222"})
     assert response.status_code == 200, response.text
     assert response.json()["action"] == "sent"
     prompt = calls[0]["system_prompt"]
@@ -190,17 +190,21 @@ async def test_playground_uses_draft_selected_ad_without_logging_or_delivery(stu
 async def test_playground_context_is_request_local(studio_client, monkeypatch):
     from app.services import chat_engine, studio
 
+    state = studio.behavior_state()
+    state["draft"]["faq"] = "REQUEST_DRAFT_MARKER"
+    studio.mutate_behavior(state["revision"], "save", state["draft"])
+
     async def fake_generate(**kwargs):
         await asyncio.sleep(0)
-        return "Цена из каталога"
+        return "Черновик" if "REQUEST_DRAFT_MARKER" in kwargs["system_prompt"] else "Опубликованное"
 
     monkeypatch.setattr(chat_engine, "generate", fake_generate)
     responses = await asyncio.gather(
-        studio_client.post("/admin/studio/playground", json={"message": "Цена?", "mode": "live"}),
-        studio_client.post("/admin/studio/playground", json={"message": "Цена?", "mode": "mock"}),
+        studio_client.post("/admin/studio/playground", json={"message": "Цена?", "source": "draft"}),
+        studio_client.post("/admin/studio/playground", json={"message": "Цена?", "source": "active"}),
     )
-    assert responses[0].json()["text"] == "Цена из каталога"
-    assert "MOCK" in responses[1].json()["text"]
+    assert responses[0].json()["text"] == "Черновик"
+    assert responses[1].json()["text"] == "Опубликованное"
     assert studio.preview_context.get() is None
 
 
@@ -212,10 +216,10 @@ async def test_playground_filters_and_hard_triggers(studio_client, monkeypatch):
         return "Телефон +7 495 123-45-67"
 
     monkeypatch.setattr(chat_engine, "generate", fake_generate)
-    response = await studio_client.post("/admin/studio/playground", json={"message": "Какие размеры?", "mode": "live"})
+    response = await studio_client.post("/admin/studio/playground", json={"message": "Какие размеры?"})
     assert response.json()["action"] == "blocked"
     assert response.json()["reason"] == "phone"
-    response = await studio_client.post("/admin/studio/playground", json={"message": "Хочу вернуть товар", "mode": "live"})
+    response = await studio_client.post("/admin/studio/playground", json={"message": "Хочу вернуть товар"})
     assert response.json()["action"] == "escalated"
     assert response.json()["model_called"] is False
 
@@ -231,7 +235,7 @@ async def test_auth_csrf_invalid_file_and_missing_model(studio_client, monkeypat
 
     monkeypatch.setenv("YC_API_KEY", "")
     get_settings.cache_clear()
-    assert (await client.post("/admin/studio/playground", json={"message": "Hi", "mode": "live"})).status_code == 503
+    assert (await client.post("/admin/studio/playground", json={"message": "Hi"})).status_code == 503
 
 
 @pytest.mark.asyncio
@@ -240,6 +244,107 @@ async def test_html_is_available_in_production_and_has_editors(studio_client):
     assert response.status_code == 200
     for value in ("Playground", "Сценарии разговора", "Шаблоны ответов", "Применить каталог", "Новый разговор"):
         assert value in response.text
+    assert "mock" not in response.text.lower()
+    for value in ("API-ключ Yandex Cloud", "ID каталога", "Проверить соединение"):
+        assert value in response.text
+
+
+@pytest.mark.asyncio
+async def test_baseline_contains_existing_rules_and_can_reset_draft(studio_client):
+    from app.services.prompt_builder import _FAQ_PATH, _PROMPT_PATH
+
+    state = (await studio_client.get("/admin/studio/state")).json()["behavior"]
+    assert state["draft"]["system_prompt"] == _PROMPT_PATH.read_text()
+    assert state["draft"]["faq"] == _FAQ_PATH.read_text()
+    assert state["draft"]["templates"]
+    assert {s["id"] for s in state["draft"]["scenarios"]} >= {"availability", "delivery", "variants"}
+    original = state["draft"]["faq"]
+    state["draft"]["faq"] = "Temporary draft"
+    saved = (await studio_client.post("/admin/studio/behavior", json={"action": "save", "revision": state["revision"], "behavior": state["draft"]})).json()
+    reset = (await studio_client.post("/admin/studio/behavior", json={"action": "baseline", "revision": saved["revision"]})).json()
+    assert reset["draft"]["faq"] == original
+    assert reset["published"] is False
+
+
+@pytest.mark.asyncio
+async def test_yandex_key_is_write_only_and_preserved_when_empty(studio_client, monkeypatch):
+    import httpx
+
+    import app.services.llm as llm
+    from app.services import studio
+    from app.services.yandex_connection import connection
+
+    secret = "test-only-key-never-return-to-browser"
+    saved = await studio_client.post("/admin/studio/yandex/save", json={"api_key": secret, "folder_id": "new-folder", "model": "yandexgpt"})
+    assert saved.status_code == 200
+    assert secret not in saved.text
+    assert saved.json()["api_key_set"] is True
+    public = await studio_client.get("/admin/studio/state")
+    assert secret not in public.text and '"api_key":' not in public.text
+    path = studio.store_root() / "credentials" / "yandex.json"
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+    await studio_client.post("/admin/studio/yandex/save", json={"api_key": "", "folder_id": "other-folder"})
+    assert connection().api_key.get_secret_value() == secret
+    assert connection().folder_id == "other-folder"
+    # The production LLM client must use the same saved connection as the playground.
+    def transport(request):
+        assert request.headers["Authorization"] == f"Api-Key {secret}"
+        assert json.loads(request.content)["modelUri"] == "gpt://other-folder/yandexgpt-lite/latest"
+        return httpx.Response(200, json={"result": {"alternatives": [{"message": {"text": "ОК"}}]}})
+
+    base_client = httpx.AsyncClient
+
+    class PatchedClient(base_client):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs, transport=httpx.MockTransport(transport))
+
+    monkeypatch.setattr(llm.httpx, "AsyncClient", PatchedClient)
+    assert await llm.generate(system_prompt="Проверка", user_messages=[]) == "ОК"
+
+
+@pytest.mark.asyncio
+async def test_connection_test_uses_unsaved_values_without_leaking_errors(studio_client, monkeypatch):
+    import app.services.llm as llm
+    from app.services.yandex_connection import connection
+
+    before = connection()
+    observed = []
+
+    async def fake_generate(**kwargs):
+        observed.append(kwargs["connection_override"])
+        return "ОК"
+
+    monkeypatch.setattr(llm, "generate", fake_generate)
+    payload = {"api_key": "test-unsaved-private-key", "folder_id": "unsaved-folder", "model": "yandexgpt"}
+    result = await studio_client.post("/admin/studio/yandex/test", json=payload)
+    assert result.status_code == 200
+    assert observed[0].api_key.get_secret_value() == payload["api_key"]
+    assert connection() == before
+    assert payload["api_key"] not in result.text
+
+    async def fail_generate(**kwargs):
+        raise llm.LLMError("Provider accidentally echoes test-unsaved-private-key")
+
+    monkeypatch.setattr(llm, "generate", fail_generate)
+    failed = await studio_client.post("/admin/studio/yandex/test", json=payload)
+    assert failed.status_code == 502
+    assert payload["api_key"] not in failed.text
+
+
+@pytest.mark.asyncio
+async def test_playground_never_falls_back_to_mock_on_model_failure(studio_client, monkeypatch):
+    from app.services import chat_engine
+
+    async def fail_generate(**kwargs):
+        raise chat_engine.LLMError("upstream unavailable")
+
+    monkeypatch.setattr(chat_engine, "generate", fail_generate)
+    failed = await studio_client.post("/admin/studio/playground", json={"message": "Цена?"})
+    assert failed.status_code == 502
+    assert "MOCK" not in failed.text
+    removed_mode = await studio_client.post("/admin/studio/playground", json={"message": "Цена?", "mode": "mock"})
+    assert removed_mode.status_code == 422
 
 
 def test_published_catalog_and_behavior_reach_live_prompt(tmp_path, monkeypatch):
